@@ -1,0 +1,19 @@
+# Environment and secrets
+.env
+.env.*
+
+# User uploads
+/uploads/
+/static/uploads/
+
+# Database and user data
+/data/
+
+# Backups
+data_backup_*/
+uploads_backup_*/
+.env.backup_*
+
+# Python cache
+__pycache__/
+*.py[cod]

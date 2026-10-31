@@ -1,0 +1,13 @@
+services:
+  web:
+    build: .
+    ports:
+      - "127.0.0.1:5051:5000"
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/static/uploads      
+    environment:
+      - TZ=Asia/Tehran
+    env_file:
+      - .env
+    restart: unless-stopped

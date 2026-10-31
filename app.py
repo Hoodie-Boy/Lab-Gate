@@ -1,0 +1,379 @@
+from flask import Flask, render_template, request, redirect, url_for, flash, send_file, session
+from database import WorkshopDB
+import qrcode
+from io import BytesIO
+import pandas as pd
+import arabic_reshaper
+from bidi.algorithm import get_display
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+import os
+import urllib.request
+from werkzeug.utils import secure_filename
+from werkzeug.security import generate_password_hash
+import requests
+from authlib.integrations.flask_client import OAuth
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = Flask(__name__)
+UPLOAD_FOLDER = os.path.join('static', 'uploads', 'profiles')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+# کلید امنیتی برای کارکرد سشن‌ها و پیام‌های فلش (Flash Messages) 
+app.secret_key = os.environ.get('SECRET_KEY', 'default_fallback_key')
+oauth = OAuth(app)
+google = oauth.register(
+    name='google',
+    client_id=os.environ.get('GOOGLE_CLIENT_ID'),
+    client_secret=os.environ.get('GOOGLE_CLIENT_SECRET'),
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={'scope': 'openid email profile'},
+)
+db = WorkshopDB()
+
+# دانلود و ثبت فونت فارسی برای ساخت PDF
+font_path = "static/fonts/Vazirmatn-Regular.ttf"
+os.makedirs(os.path.dirname(font_path), exist_ok=True)
+if not os.path.exists(font_path):
+    urllib.request.urlretrieve("https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-Regular.ttf", font_path)
+pdfmetrics.registerFont(TTFont('Vazir', font_path))
+
+def convert_persian_to_english(text):
+    translation_table = str.maketrans('۰۱۲۳۴۵۶۷۸۹', '0123456789')
+    return str(text).translate(translation_table)
+
+def generate_qrcode_image(student_id):
+    # آدرس آی‌پی خود را در صورت نیاز اینجا بروزرسانی کنید
+    link = f"http://10.22.45.172:5000/scan?sid={student_id}"
+    qr = qrcode.QRCode(version=1, box_size=10, border=2)
+    qr.add_data(link)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buffer = BytesIO()
+    img.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+def generate_pdf_report(df):
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), rightMargin=20, leftMargin=20, topMargin=20, bottomMargin=20)
+    elements = []
+    styles = getSampleStyleSheet()
+    
+    # استایل تیتر (سرمه‌ای تیره)
+    title_style = ParagraphStyle(
+        name='Title', fontName='Vazir', fontSize=16, alignment=1, spaceAfter=20, textColor=colors.HexColor('#2C3E50')
+    )
+    
+    def persian_text(text):
+        if pd.isnull(text):
+            text = "---"
+        reshaped = arabic_reshaper.reshape(str(text))
+        return get_display(reshaped)
+
+    elements.append(Paragraph(persian_text("📋 گزارش جامع تردد دانشجویان کارگاه"), title_style))
+    
+    if not df.empty:
+        df_rtl = df[df.columns[::-1]]
+        table_data = [[persian_text(col) for col in df_rtl.columns]]
+        for _, row in df_rtl.iterrows():
+            table_data.append([persian_text(cell) for cell in row])
+            
+        t = Table(table_data)
+        
+        # طراحی جدید جدول: تمیز، روشن و کاملاً خوانا (مناسب پرینت)
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#2C3E50')), # هدر سرمه‌ای حرفه‌ای
+            ('TEXTCOLOR', (0,0), (-1,0), colors.white),                # متن هدر سفید
+            ('TEXTCOLOR', (0,1), (-1,-1), colors.black),               # متن داده‌ها مشکی خالص
+            ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+            ('FONTNAME', (0,0), (-1,-1), 'Vazir'),
+            ('FONTSIZE', (0,0), (-1,0), 12),
+            ('FONTSIZE', (0,1), (-1,-1), 10),
+            ('TOPPADDING', (0,0), (-1,-1), 8),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+            # پس‌زمینه ردیف‌ها یکی‌درمیان سفید و طوسی بسیار روشن
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.HexColor('#F8F9F9'), colors.HexColor('#FFFFFF')]), 
+            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#BDC3C7')), # خطوط کشی طوسی ملایم
+        ]))
+        elements.append(t)
+        
+    doc.build(elements)
+    buffer.seek(0)
+    return buffer
+
+
+# ================= مسيرهای وب (Routes) =================
+
+@app.route('/')
+def index():
+    online_users = db.get_active_students()
+    return render_template('index.html', online_users=online_users)
+
+@app.route('/scan')
+def scan():
+    sid = request.args.get('sid')
+    if sid:
+        clean_id = convert_persian_to_english(sid)
+        status, msg = db.process_scan(clean_id)
+        if status:
+            flash(msg, "success")
+        else:
+            flash(msg, "error")
+    return redirect(url_for('index'))
+
+@app.route('/manual_scan', methods=['POST'])
+def manual_scan():
+    sid = request.form.get('student_id')
+    if sid:
+        clean_id = convert_persian_to_english(sid)
+        status, msg = db.process_scan(clean_id)
+        if status:
+            flash(msg, "success")
+        else:
+            flash(msg, "error")
+    return redirect(url_for('index'))
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        # اگر نام از گوگل آمده باشد آن را می‌گیریم، در غیر این صورت از فرم HTML
+        name = session.get('google_name') or request.form.get('name')
+        sid = request.form.get('student_id')
+        username = request.form.get('username')
+        password = request.form.get('password')
+        file = request.files.get('profile_photo')
+
+        if name and sid and username and password:
+            clean_id = convert_persian_to_english(sid)
+            image_db_path = ""
+            
+            try:
+                # حالت اول: کاربر فایل عکس را دستی آپلود کرده است
+                if file and file.filename != '':
+                    filename = secure_filename(f"{clean_id}_{file.filename}")
+                    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                    file.save(filepath)
+                    image_db_path = f"uploads/profiles/{filename}"
+                
+                # حالت دوم: کاربر با گوگل آمده و عکس پروفایل گوگل دارد
+                elif session.get('google_picture'):
+                    pic_response = requests.get(session.get('google_picture'))
+                    filename = secure_filename(f"{clean_id}_google.jpg")
+                    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                    with open(filepath, 'wb') as f:
+                        f.write(pic_response.content)
+                    image_db_path = f"uploads/profiles/{filename}"
+
+                # هش کردن رمز و ثبت در دیتابیس
+                hashed_password = generate_password_hash(password)
+                status, msg = db.add_student(clean_id, name, username, hashed_password, image_db_path)
+                
+                if status:
+                    # پاک کردن اطلاعات موقت گوگل از سشن پس از ثبت‌نام موفق
+                    session.pop('google_name', None)
+                    session.pop('google_email', None)
+                    session.pop('google_picture', None)
+                    
+                    flash("هویت با موفقیت ثبت شد.", "success")
+                    return redirect(url_for('view_card', sid=clean_id))
+                else:
+                    flash(msg, "error")
+            except Exception as e:
+                flash(f"خطا در پردازش اطلاعات: {e}", "error")
+        else:
+            flash("لطفاً تمام فیلدها را پر کنید.", "error")
+            
+    return render_template('register.html')
+
+@app.route('/login/google')
+def login_google():
+    # هدایت دانشجو به صفحه تایید گوگل
+    redirect_uri = url_for('auth_callback', _external=True)
+    return google.authorize_redirect(redirect_uri)
+
+@app.route('/auth/callback')
+def auth_callback():
+    try:
+        # دریافت اطلاعات پروفایل از گوگل
+        token = google.authorize_access_token()
+        user_info = token.get('userinfo')
+        
+        # ذخیره اطلاعات در حافظه موقت (Session) برای فرم ثبت‌نام
+        session['google_name'] = user_info.get('name')
+        session['google_email'] = user_info.get('email')
+        session['google_picture'] = user_info.get('picture')
+        
+        flash(f"سلام {user_info.get('name')}! اطلاعات شما دریافت شد. فرم را تکمیل کنید.", "success")
+        return redirect(url_for('register'))
+    except Exception as e:
+        flash("خطا در دریافت اطلاعات از گوگل.", "error")
+        return redirect(url_for('register'))
+    
+@app.route('/card', methods=['GET', 'POST'])
+def view_card():
+    sid = request.args.get('sid') or request.form.get('student_id')
+    student_name = None
+    if sid:
+        clean_id = convert_persian_to_english(sid)
+        student_name = db.get_student(clean_id)
+        if not student_name:
+            flash("هویتی یافت نشد.", "error")
+            sid = None
+    return render_template('card.html', student_name=student_name, sid=sid)
+
+@app.route('/qrcode/<sid>')
+def get_qrcode(sid):
+    buffer = generate_qrcode_image(sid)
+    return send_file(buffer, mimetype='image/png', as_attachment=True, download_name=f'qr_{sid}.png')
+
+@app.route('/leaderboard')
+def leaderboard():
+    df = db.get_leaderboard_df()
+    # تبدیل دیتافریم به HTML تمیز برای نمایش در فرانت‌اند
+    table_html = df.to_html(classes='dataframe', index=False, justify='center') if not df.empty else None
+    top_week = db.get_top_student_of_week()
+    return render_template('leaderboard.html', table_html=table_html, top_week=top_week)
+
+@app.route('/admin', methods=['GET', 'POST'])
+def admin():
+    try:
+        # بررسی وضعیت لاگین
+        if not session.get('admin_logged_in'):
+            if request.method == 'POST':
+                password = request.form.get('password')
+                if password == os.environ.get("ADMIN_PASSWORD"):
+                    session['admin_logged_in'] = True
+                    return redirect(url_for('admin'))
+                else:
+                    flash("احراز هویت ناموفق بود.", "error")
+            return render_template('admin_login.html')
+        
+        # استخراج داده‌ها از دیتابیس
+        logs_df = db.get_all_logs_df()
+        students_df = db.get_all_students_df()
+        
+        raw_students = db.get_all_students_raw() 
+        raw_logs = db.get_all_logs_raw() 
+        
+        active_count = len(logs_df[logs_df['زمان خروج'] == "---"]) if not logs_df.empty else 0
+        stats = {
+            'students': len(students_df),
+            'logs': len(logs_df),
+            'active': active_count
+        }
+        
+        # رندر کردن صفحه داشبورد
+        return render_template('admin.html', stats=stats, 
+                               logs_data=raw_logs, 
+                               students_data=raw_students,
+                               logs_table=logs_df.to_html(classes='dataframe', index=False) if not logs_df.empty else None,
+                               students_table=students_df.to_html(classes='dataframe', index=False) if not students_df.empty else None)
+                               
+    except Exception as e:
+        # اگر هرجایی از مسیر بالا خراب شود، ارور دقیق روی صفحه چاپ می‌شود
+        import traceback
+        error_details = traceback.format_exc()
+        return f"<h3 style='color:red; direction:rtl; font-family:tahoma; padding:20px;'>خطای سرور در بارگذاری داشبورد:</h3><pre style='direction:ltr; text-align:left; background:#111; color:#0f0; padding:20px; font-size:14px;'>{error_details}</pre>", 500
+# ---------------- مسیرهای مدیریت (CRUD) ----------------
+
+@app.route('/admin/delete_log/<int:log_id>', methods=['POST'])
+def delete_log(log_id):
+    if not session.get('admin_logged_in'):
+        return redirect(url_for('admin'))
+        
+    if db.delete_log(log_id):
+         flash("رکورد تردد با موفقیت حذف شد.", "success")
+    else:
+         flash("خطا در حذف رکورد.", "error")
+    return redirect(url_for('admin'))
+
+@app.route('/admin/edit_log', methods=['POST'])
+def edit_log():
+    if not session.get('admin_logged_in'):
+        return redirect(url_for('admin'))
+        
+    log_id = request.form.get('log_id')
+    new_entry = request.form.get('enter_time')
+    new_exit = request.form.get('exit_time')
+    
+    # اگر کاربر در فرم "---" را برای خروج گذاشته بود، آن را به خالی تغییر می‌دهیم
+    if new_exit == "---":
+         new_exit = ""
+         
+    if db.update_log_time(log_id, new_entry, new_exit):
+        flash("ساعات تردد با موفقیت اصلاح شد.", "success")
+    else:
+        flash("خطا در آپدیت زمان تردد.", "error")
+    return redirect(url_for('admin'))
+
+@app.route('/admin/delete_student/<student_id>', methods=['POST'])
+def delete_student_route(student_id):
+    if not session.get('admin_logged_in'):
+        return redirect(url_for('admin'))
+        
+    if db.delete_student(student_id):
+        flash("کاربر و تمامی سوابق وی حذف شدند.", "success")
+    else:
+        flash("خطا در حذف کاربر.", "error")
+    return redirect(url_for('admin'))
+
+@app.route('/admin/edit_student', methods=['POST'])
+def edit_student_route():
+    if not session.get('admin_logged_in'):
+        return redirect(url_for('admin'))
+        
+    old_id = request.form.get('old_student_id')
+    new_id = request.form.get('student_id')
+    name = request.form.get('name')
+    username = request.form.get('username')
+    
+    clean_old_id = convert_persian_to_english(old_id)
+    clean_new_id = convert_persian_to_english(new_id)
+
+    status, msg = db.update_student(clean_old_id, clean_new_id, name, username)
+    if status:
+        flash(msg, "success")
+    else:
+        flash(msg, "error")
+        
+    return redirect(url_for('admin'))
+
+@app.route('/logout')
+def logout():
+    session.pop('admin_logged_in', None)
+    return redirect(url_for('admin'))
+
+@app.route('/download/pdf')
+def download_pdf():
+    if not session.get('admin_logged_in'):
+        return redirect(url_for('admin'))
+    df = db.get_all_logs_df()
+    buffer = generate_pdf_report(df)
+    return send_file(buffer, mimetype='application/pdf', as_attachment=True, download_name='attendance_report.pdf')
+
+@app.route('/download/csv/<type>')
+def download_csv(type):
+    if not session.get('admin_logged_in'):
+        return redirect(url_for('admin'))
+        
+    if type == 'logs':
+        df = db.get_all_logs_df()
+        filename = 'logs.csv'
+    else:
+        df = db.get_all_students_df()
+        filename = 'students.csv'
+        
+    csv = df.to_csv(index=False).encode('utf-8-sig')
+    buffer = BytesIO(csv)
+    return send_file(buffer, mimetype='text/csv', as_attachment=True, download_name=filename)
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
